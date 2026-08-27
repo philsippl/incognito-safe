@@ -1,0 +1,7 @@
+/target
+.DS_Store
+.env
+safe.yml
+*.seed
+/generated/
+incognito-safe-deployment-*.json

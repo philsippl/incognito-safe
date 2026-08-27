@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Lints
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        run: cargo test --all-targets --all-features --locked
+
+  anvil-e2e:
+    name: Anvil E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ANVIL_FORK_URL: https://ethereum-rpc.publicnode.com
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Verify Anvil installation
+        run: anvil --version
+      - name: Forked Safe deployment E2E
+        run: cargo test --test anvil_e2e --locked -- --ignored --nocapture
