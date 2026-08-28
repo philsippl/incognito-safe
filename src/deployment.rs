@@ -74,6 +74,16 @@ impl SafeVariant {
     }
 }
 
+/// Returns the singleton that a deployed proxy must use on the target chain.
+#[must_use]
+pub const fn expected_runtime_singleton(chain_id: u64, variant: SafeVariant) -> Address {
+    match variant {
+        SafeVariant::Portable if chain_id != 1 => L2_SINGLETON.address,
+        SafeVariant::Portable | SafeVariant::L1 => L1_SINGLETON.address,
+        SafeVariant::L2 => L2_SINGLETON.address,
+    }
+}
+
 /// All deterministic inputs and results needed to deploy a Safe.
 #[derive(Clone, Debug)]
 pub struct Prediction {
@@ -197,11 +207,7 @@ pub async fn predict_safe<P: Provider>(
         SafeVariant::Portable | SafeVariant::L1 => L1_SINGLETON.address,
         SafeVariant::L2 => L2_SINGLETON.address,
     };
-    let expected_runtime_singleton = match variant {
-        SafeVariant::Portable if chain_id != 1 => L2_SINGLETON.address,
-        SafeVariant::Portable | SafeVariant::L1 => L1_SINGLETON.address,
-        SafeVariant::L2 => L2_SINGLETON.address,
-    };
+    let expected_runtime_singleton = expected_runtime_singleton(chain_id, variant);
     let initializer = build_initializer(config, variant);
     let factory = ISafeProxyFactory::new(FACTORY.address, provider);
     let proxy_creation_code = factory
@@ -256,19 +262,7 @@ pub async fn deploy_safe<P: Provider>(
     )
     .await
     .context("pre-send revalidation failed")?;
-    ensure!(
-        rederived.chain_id == prediction.chain_id,
-        "RPC chain changed from {} to {} before deployment",
-        prediction.chain_id,
-        rederived.chain_id
-    );
-    ensure!(
-        rederived.address == prediction.address
-            && rederived.singleton == prediction.singleton
-            && rederived.initializer == prediction.initializer
-            && rederived.salt == prediction.salt,
-        "deployment inputs changed during pre-send revalidation"
-    );
+    ensure_rederived_prediction(prediction, &rederived)?;
     let existing = provider
         .get_code_at(prediction.address)
         .await
@@ -282,11 +276,13 @@ pub async fn deploy_safe<P: Provider>(
     let factory = ISafeProxyFactory::new(FACTORY.address, provider);
     let nonce = U256::from_be_bytes(prediction.seed.0);
     let pending = if prediction.chain_specific {
-        let call = factory.createChainSpecificProxyWithNonceL2(
-            prediction.singleton,
-            prediction.initializer.clone(),
-            nonce,
-        );
+        let call = factory
+            .createChainSpecificProxyWithNonceL2(
+                prediction.singleton,
+                prediction.initializer.clone(),
+                nonce,
+            )
+            .chain_id(prediction.chain_id);
         let simulated = call
             .call()
             .await
@@ -300,11 +296,9 @@ pub async fn deploy_safe<P: Provider>(
             .await
             .context("failed to submit deployment transaction")?
     } else {
-        let call = factory.createProxyWithNonceL2(
-            prediction.singleton,
-            prediction.initializer.clone(),
-            nonce,
-        );
+        let call = factory
+            .createProxyWithNonceL2(prediction.singleton, prediction.initializer.clone(), nonce)
+            .chain_id(prediction.chain_id);
         let simulated = call
             .call()
             .await
@@ -339,6 +333,24 @@ pub async fn deploy_safe<P: Provider>(
         block_number,
         runtime_singleton,
     })
+}
+
+fn ensure_rederived_prediction(expected: &Prediction, rederived: &Prediction) -> Result<()> {
+    ensure!(
+        rederived.chain_id == expected.chain_id,
+        "RPC chain changed from {} to {} before deployment",
+        expected.chain_id,
+        rederived.chain_id
+    );
+    ensure!(
+        rederived.address == expected.address
+            && rederived.singleton == expected.singleton
+            && rederived.expected_runtime_singleton == expected.expected_runtime_singleton
+            && rederived.initializer == expected.initializer
+            && rederived.salt == expected.salt,
+        "deployment inputs changed during pre-send revalidation"
+    );
+    Ok(())
 }
 
 /// Verifies code, singleton, version, owners, and threshold after deployment.
@@ -514,6 +526,20 @@ async fn verify_contract<P: Provider>(provider: &P, spec: ContractSpec) -> Resul
 mod tests {
     use super::*;
 
+    fn prediction_fixture() -> Prediction {
+        Prediction {
+            address: address!("2222222222222222222222222222222222222222"),
+            chain_id: 480,
+            seed: b256!("0101010101010101010101010101010101010101010101010101010101010101"),
+            singleton: L1_SINGLETON.address,
+            expected_runtime_singleton: L2_SINGLETON.address,
+            initializer: Bytes::from_static(b"initializer"),
+            salt: b256!("0202020202020202020202020202020202020202020202020202020202020202"),
+            variant: SafeVariant::Portable,
+            chain_specific: false,
+        }
+    }
+
     #[test]
     fn matches_eip_1014_vectors() {
         assert_eq!(
@@ -557,6 +583,40 @@ mod tests {
             build_initializer(&config, SafeVariant::L1),
             build_initializer(&config, SafeVariant::L2)
         );
+    }
+
+    #[test]
+    fn runtime_singleton_depends_on_effective_variant_and_chain() {
+        assert_eq!(
+            expected_runtime_singleton(1, SafeVariant::Portable),
+            L1_SINGLETON.address
+        );
+        assert_eq!(
+            expected_runtime_singleton(480, SafeVariant::Portable),
+            L2_SINGLETON.address
+        );
+        assert_eq!(
+            expected_runtime_singleton(480, SafeVariant::L1),
+            L1_SINGLETON.address
+        );
+        assert_eq!(
+            expected_runtime_singleton(1, SafeVariant::L2),
+            L2_SINGLETON.address
+        );
+    }
+
+    #[test]
+    fn pre_send_rederivation_checks_runtime_singleton_and_chain() {
+        let expected = prediction_fixture();
+        ensure_rederived_prediction(&expected, &expected).unwrap();
+
+        let mut changed = expected.clone();
+        changed.expected_runtime_singleton = L1_SINGLETON.address;
+        assert!(ensure_rederived_prediction(&expected, &changed).is_err());
+
+        changed = expected.clone();
+        changed.chain_id = 1;
+        assert!(ensure_rederived_prediction(&expected, &changed).is_err());
     }
 
     #[test]

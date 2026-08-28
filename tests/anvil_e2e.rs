@@ -50,6 +50,8 @@ async fn generate_fund_deploy_and_verify_real_safe() {
     assert_saved_artifact(deployment_file, predicted, &generated);
 
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    assert_verify_is_read_only(&provider, &endpoint, deployment_file, predicted).await;
+
     let funded_balance = U256::from(10).pow(U256::from(18));
     provider
         .anvil_set_balance(predicted, funded_balance)
@@ -61,6 +63,16 @@ async fn generate_fund_deploy_and_verify_real_safe() {
     );
     assert!(provider.get_code_at(predicted).await.unwrap().is_empty());
 
+    assert_wrong_confirmation_is_read_only(
+        &provider,
+        &endpoint,
+        deployment_file,
+        predicted,
+        funded_balance,
+    )
+    .await;
+
+    let confirmed_address = predicted.to_checksum(None);
     let deployed = Command::new(env!("CARGO_BIN_EXE_incognito-safe"))
         .args([
             "--rpc-url",
@@ -69,6 +81,8 @@ async fn generate_fund_deploy_and_verify_real_safe() {
             "deploy",
             "--file",
             deployment_file,
+            "--confirm-address",
+            &confirmed_address,
         ])
         .env("INC_SAFE_PRIVATE_KEY", ANVIL_FIRST_KEY)
         .output()
@@ -109,6 +123,73 @@ async fn generate_fund_deploy_and_verify_real_safe() {
     assert_eq!(replicated["signer_count"], 1);
     assert_eq!(replicated["threshold"], 1);
     assert_ne!(replicated["address"], generated["address"]);
+}
+
+async fn assert_verify_is_read_only<P: Provider>(
+    provider: &P,
+    endpoint: &str,
+    deployment_file: &str,
+    predicted: Address,
+) {
+    assert!(provider.get_code_at(predicted).await.unwrap().is_empty());
+    assert_eq!(provider.get_balance(predicted).await.unwrap(), U256::ZERO);
+
+    let block_before_verify = provider.get_block_number().await.unwrap();
+    run_cli(&[
+        "--rpc-url",
+        endpoint,
+        "--json",
+        "verify",
+        "--file",
+        deployment_file,
+    ]);
+
+    assert_eq!(
+        provider.get_block_number().await.unwrap(),
+        block_before_verify
+    );
+    assert!(provider.get_code_at(predicted).await.unwrap().is_empty());
+    assert_eq!(provider.get_balance(predicted).await.unwrap(), U256::ZERO);
+}
+
+async fn assert_wrong_confirmation_is_read_only<P: Provider>(
+    provider: &P,
+    endpoint: &str,
+    deployment_file: &str,
+    predicted: Address,
+    funded_balance: U256,
+) {
+    let block_before_rejected_deploy = provider.get_block_number().await.unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_incognito-safe"))
+        .args([
+            "--rpc-url",
+            endpoint,
+            "--json",
+            "deploy",
+            "--file",
+            deployment_file,
+            "--confirm-address",
+            "0x0000000000000000000000000000000000000001",
+        ])
+        .env("INC_SAFE_PRIVATE_KEY", ANVIL_FIRST_KEY)
+        .output()
+        .expect("failed to execute deploy command with wrong confirmation");
+
+    assert!(
+        !rejected.status.success(),
+        "deploy unexpectedly accepted the wrong confirmation:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert_eq!(
+        provider.get_block_number().await.unwrap(),
+        block_before_rejected_deploy
+    );
+    assert!(provider.get_code_at(predicted).await.unwrap().is_empty());
+    assert_eq!(
+        provider.get_balance(predicted).await.unwrap(),
+        funded_balance
+    );
 }
 
 fn assert_saved_artifact(path: &str, predicted: Address, generated: &Value) {
