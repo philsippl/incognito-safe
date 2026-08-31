@@ -228,6 +228,12 @@ unset ANVIL_FORK_URL
 
 The demo uses the core `--no-default-features` build and a software key. It generates an address, verifies it before funding, funds it with 1 test ETH, deploys the confirmed Safe, and verifies that the balance remains. Anvil receives the fork URL as a process argument, so use a non-secret or short-lived endpoint and do not publish its logs. CI runs core and all-feature test matrices and invokes the ignored Anvil E2E explicitly with a public credential-free fork URL.
 
+> **Repository packaging issue:** The test harness documented below is not included in the
+> repository. `README.md` instructs users to run `fork-tests/run.sh` and
+> `fork-tests/cli_e2e.sh`, while `.gitignore` ignores the entire directory and the repository
+> contains neither script. `SECURITY.md` also makes these scripts part of the release checklist.
+> Either commit the scripts and ignore only their generated outputs, or remove these references.
+
 The extended fork scripts require caller-supplied trusted endpoints and have no embedded RPC credential fallbacks:
 
 ```sh
