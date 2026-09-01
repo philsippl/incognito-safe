@@ -9,7 +9,16 @@ permissions:
 
 jobs:
   rust:
+    name: Rust (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            feature_args: --no-default-features
+          - name: all features
+            feature_args: --all-features
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -19,9 +28,9 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
       - name: Lints
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --all-targets ${{ matrix.feature_args }} --locked -- -D warnings
       - name: Tests
-        run: cargo test --all-targets --all-features --locked
+        run: cargo test --all-targets ${{ matrix.feature_args }} --locked
 
   anvil-e2e:
     name: Anvil E2E

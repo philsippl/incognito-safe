@@ -2448,11 +2448,13 @@ dependencies = [
  "anyhow",
  "clap",
  "getrandom 0.4.3",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
  "time",
  "tokio",
+ "url",
  "yaml-rust2",
  "zeroize",
 ]

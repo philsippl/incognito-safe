@@ -5,3 +5,11 @@ safe.yml
 *.seed
 /generated/
 incognito-safe-deployment-*.json
+
+# Local fork-test harness (do not push)
+/fork-tests/
+/fork-tests/cache/
+/fork-tests/lib/
+/fork-tests/out/
+/fork-tests/src/
+/fork-tests/test/

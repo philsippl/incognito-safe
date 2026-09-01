@@ -1,6 +1,6 @@
 //! Strict Safe owner configuration loading and validation.
 
-use std::{collections::HashSet, fs, path::Path, str::FromStr};
+use std::{collections::HashSet, fs::File, io::Read, path::Path, str::FromStr};
 
 use alloy::primitives::{Address, address};
 use anyhow::{Context, Result, bail, ensure};
@@ -46,13 +46,13 @@ impl SafeConfig {
         );
 
         let mut unique = HashSet::with_capacity(self.signers.len());
-        for signer in &self.signers {
+        for (index, signer) in self.signers.iter().enumerate() {
             ensure!(*signer != Address::ZERO, "zero address cannot be a signer");
             ensure!(
                 *signer != SENTINEL_OWNERS,
                 "Safe's sentinel address 0x0000000000000000000000000000000000000001 cannot be a signer"
             );
-            ensure!(unique.insert(*signer), "duplicate signer: {signer}");
+            ensure!(unique.insert(*signer), "duplicate signer at index {index}");
         }
         Ok(())
     }
@@ -65,7 +65,7 @@ impl SafeConfig {
     pub fn validate_predicted_address(&self, predicted: Address) -> Result<()> {
         ensure!(
             !self.signers.contains(&predicted),
-            "the predicted Safe address {predicted} cannot also be a signer"
+            "the predicted Safe address cannot also be a signer"
         );
         Ok(())
     }
@@ -78,10 +78,13 @@ impl SafeConfig {
 /// Returns an error if the file cannot be safely read or does not exactly match
 /// the supported schema and Safe owner invariants.
 pub fn load_config(path: &Path) -> Result<SafeConfig> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("failed to inspect config {}", path.display()))?;
+    let file = open_config_for_read(path)
+        .with_context(|| format!("failed to open config {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened config {}", path.display()))?;
     ensure!(
-        metadata.is_file(),
+        metadata.file_type().is_file(),
         "config is not a regular file: {}",
         path.display()
     );
@@ -90,8 +93,15 @@ pub fn load_config(path: &Path) -> Result<SafeConfig> {
         "config exceeds the {MAX_CONFIG_BYTES}-byte safety limit"
     );
 
-    let input = fs::read_to_string(path)
+    let mut input = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut input)
         .with_context(|| format!("failed to read config {}", path.display()))?;
+    ensure!(
+        input.len() as u64 <= MAX_CONFIG_BYTES,
+        "config exceeds the {MAX_CONFIG_BYTES}-byte safety limit"
+    );
+    let input = String::from_utf8(input).context("config is not valid UTF-8")?;
     reject_advanced_yaml(&input)?;
     let documents = YamlLoader::load_from_str(&input).context("invalid YAML config")?;
     ensure!(
@@ -126,6 +136,24 @@ pub fn load_config(path: &Path) -> Result<SafeConfig> {
     let config = SafeConfig { signers, threshold };
     config.validate()?;
     Ok(config)
+}
+
+#[cfg(unix)]
+fn open_config_for_read(path: &Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn open_config_for_read(path: &Path) -> std::io::Result<File> {
+    File::open(path)
 }
 
 /// Reject anchors, aliases, and tags before the object loader can expand them.
@@ -173,7 +201,7 @@ fn reject_unknown_keys(map: &Hash, allowed: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{fs, io::Write};
 
     use super::*;
 
@@ -220,5 +248,127 @@ threshold: 2
         ] {
             assert!(parse(invalid).is_err(), "unexpectedly accepted: {invalid}");
         }
+    }
+
+    #[test]
+    fn duplicate_error_does_not_disclose_owner_address() {
+        let owner = "0x1111111111111111111111111111111111111111";
+        let error = parse(&format!(
+            "signers: [\"{owner}\", \"{owner}\"]\nthreshold: 1\n"
+        ))
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("duplicate signer at index 1"));
+        assert!(!message.contains(owner));
+    }
+
+    #[test]
+    fn self_owner_error_does_not_disclose_address() {
+        let predicted = address!("1111111111111111111111111111111111111111");
+        let config = SafeConfig {
+            signers: vec![predicted],
+            threshold: 1,
+        };
+        let error = config.validate_predicted_address(predicted).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("predicted Safe address cannot also be a signer"));
+        assert!(!message.contains(&predicted.to_string()));
+    }
+
+    #[test]
+    fn rejects_directory_oversize_and_invalid_utf8_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(load_config(directory.path()).is_err());
+
+        let oversized = directory.path().join("oversized.yml");
+        let file = File::create(&oversized).unwrap();
+        file.set_len(MAX_CONFIG_BYTES + 1).unwrap();
+        drop(file);
+        assert!(
+            load_config(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+
+        let invalid_utf8 = directory.path().join("invalid-utf8.yml");
+        fs::write(&invalid_utf8, [0xff, 0xfe]).unwrap();
+        assert!(
+            load_config(&invalid_utf8)
+                .unwrap_err()
+                .to_string()
+                .contains("not valid UTF-8")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_final_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.yml");
+        fs::write(
+            &target,
+            "signers: [\"0x1111111111111111111111111111111111111111\"]\nthreshold: 1\n",
+        )
+        .unwrap();
+        let link = directory.path().join("link.yml");
+        symlink(&target, &link).unwrap();
+        assert!(load_config(&link).is_err());
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_vendor = "apple",
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "vita",
+            target_os = "wasi",
+            target_os = "redox"
+        ))
+    ))]
+    #[test]
+    fn rejects_fifo_without_blocking() {
+        use rustix::fs::{CWD, Mode, mkfifoat};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("config.fifo");
+        mkfifoat(CWD, &fifo, Mode::from_raw_mode(0o600)).unwrap();
+        let error = load_config(&fifo).unwrap_err().to_string();
+        assert!(error.contains("not a regular file"));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn rejects_unix_domain_socket_input() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("config.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        assert!(load_config(&socket).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intermediate_directory_symlink_remains_supported() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let real_parent = directory.path().join("real-parent");
+        fs::create_dir(&real_parent).unwrap();
+        let config_path = real_parent.join("config.yml");
+        fs::write(
+            &config_path,
+            "signers: [\"0x1111111111111111111111111111111111111111\"]\nthreshold: 1\n",
+        )
+        .unwrap();
+        let linked_parent = directory.path().join("linked-parent");
+        symlink(&real_parent, &linked_parent).unwrap();
+
+        let loaded = load_config(&linked_parent.join("config.yml")).unwrap();
+        assert_eq!(loaded.threshold, 1);
     }
 }
